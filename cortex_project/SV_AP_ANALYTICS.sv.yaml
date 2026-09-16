@@ -1,0 +1,216 @@
+name: SV_AP_ANALYTICS
+description: >-
+  This semantic view supports Accounts Payable analytics across four ERP source
+  systems (SAP, Oracle, Baan, Workday). It models conformed invoice data at the
+  individual invoice level and enables analysis of vendor spend, approval
+  backlogs, payment terms mix, and overdue exposure. Invoice amounts are in the
+  original transaction currency (USD, EUR, GBP) and must not be aggregated
+  across currencies without grouping by currency code. Approval statuses are
+  normalized to APPROVED or PENDING. Intended for AP managers, Finance
+  controllers, and Procurement leads.
+tables:
+  - name: SILVER_AP_INVOICES
+    description: >-
+      Represents conformed AP invoices consolidated from SAP, Oracle, Baan, and
+      Workday source systems. Grain: one row per unique invoice per source
+      system. Each row carries the original transaction currency, normalized
+      approval status, and normalized payment terms. System-specific metadata
+      columns are excluded; join back to bronze tables via SOURCE_INVOICE_ID
+      plus SOURCE_SYSTEM for audit traceability.
+    base_table:
+      database: COCO_WORKSHOP
+      schema: PIPELINE_LAB
+      table: SILVER_AP_INVOICES
+    dimensions:
+      - name: SOURCE_SYSTEM
+        expr: SOURCE_SYSTEM
+        data_type: VARCHAR
+        description: >-
+          The ERP system that originated this invoice. Values: SAP, ORACLE,
+          BAAN, WORKDAY. Use to filter or segment analysis by source system.
+      - name: SOURCE_INVOICE_ID
+        expr: SOURCE_INVOICE_ID
+        data_type: VARCHAR
+        description: >-
+          Unique identifier for this invoice within its source system. Not
+          globally unique on its own — combine with SOURCE_SYSTEM for a
+          composite key.
+      - name: INVOICE_NUMBER
+        expr: INVOICE_NUMBER
+        data_type: VARCHAR
+        description: >-
+          Business-facing invoice reference number visible on the physical
+          document. Unique within each source system after deduplication.
+      - name: VENDOR_ID
+        expr: VENDOR_ID
+        data_type: VARCHAR
+        description: >-
+          Source-system vendor or supplier identifier. Not cross-referenced
+          across systems — the same real-world vendor may have different IDs in
+          different ERPs. Use VENDOR_NAME for user-facing grouping.
+      - name: VENDOR_NAME
+        expr: VENDOR_NAME
+        data_type: VARCHAR
+        description: >-
+          Display name of the vendor or supplier. Best column for grouping
+          spend by vendor in reports. May contain non-ASCII characters from
+          European vendor names.
+      - name: CURRENCY_CODE
+        expr: CURRENCY_CODE
+        data_type: VARCHAR
+        description: >-
+          ISO 4217 currency code for the invoice amount (USD, EUR, GBP). No
+          FX conversion is applied at this layer. Always group by or filter on
+          this column when aggregating INVOICE_AMOUNT to avoid mixing
+          currencies.
+      - name: PAYMENT_TERMS
+        expr: PAYMENT_TERMS
+        data_type: VARCHAR
+        description: >-
+          Normalized payment terms. Values: NET30, NET60. Standardized from
+          source-specific formats (N30, Net 30, etc.). Original values
+          preserved in PAYMENT_TERMS_RAW.
+      - name: PAYMENT_TERMS_RAW
+        expr: PAYMENT_TERMS_RAW
+        data_type: VARCHAR
+        description: >-
+          Original payment terms value from the source system before
+          normalization. Use for audit and source-system-specific analysis.
+      - name: PO_NUMBER
+        expr: PO_NUMBER
+        data_type: VARCHAR
+        description: >-
+          Purchase order number associated with the invoice. Nullable — roughly
+          15% of Baan invoices and 10% of Workday invoices have no PO
+          (service invoices).
+      - name: LINE_DESCRIPTION
+        expr: LINE_DESCRIPTION
+        data_type: VARCHAR
+        description: >-
+          Free-text description of the invoice line item. May contain
+          descriptions in multiple languages (Dutch from Baan, German from
+          Oracle EMEA).
+      - name: GL_ACCOUNT
+        expr: GL_ACCOUNT
+        data_type: VARCHAR
+        description: >-
+          General ledger account code in the source system format. Each source
+          uses a different chart of accounts (SAP: 5100-10, Oracle: A5100-40,
+          Baan: GL-510, Workday: LA-6200). Not cross-mapped at this layer.
+      - name: COST_CENTER
+        expr: COST_CENTER
+        data_type: VARCHAR
+        description: >-
+          Cost center or department code in the source system format.
+          Granularity varies: SAP uses sub-department codes (CC-ENG-01),
+          Oracle uses department codes (D-ENG), Baan uses BC-prefixed codes,
+          Workday uses WCC-prefixed codes. Use as a proxy for business unit.
+      - name: APPROVAL_STATUS
+        expr: APPROVAL_STATUS
+        data_type: VARCHAR
+        description: >-
+          Normalized approval status. Values: APPROVED, PENDING. Mapped from
+          source-specific statuses (Oracle VALIDATED, Baan POSTED, Workday In
+          Review all map to their normalized equivalents). Original values
+          preserved in APPROVAL_STATUS_RAW.
+      - name: APPROVAL_STATUS_RAW
+        expr: APPROVAL_STATUS_RAW
+        data_type: VARCHAR
+        description: >-
+          Original approval status from the source system before
+          normalization. Use for audit and to verify status mapping rules.
+    time_dimensions:
+      - name: INVOICE_DATE
+        expr: INVOICE_DATE
+        data_type: DATE
+        description: >-
+          Date the invoice was issued. Primary time dimension for trend
+          analysis, monthly spend reporting, and period-over-period
+          comparisons.
+      - name: DUE_DATE
+        expr: DUE_DATE
+        data_type: DATE
+        description: >-
+          Date payment is due. Compare to CURRENT_DATE for overdue analysis.
+          No paid/unpaid flag exists in this dataset, so overdue is defined as
+          DUE_DATE before today.
+      - name: CREATED_AT
+        expr: CREATED_AT
+        data_type: TIMESTAMP_NTZ
+        description: >-
+          Timestamp when the invoice record was created in the source ERP
+          system. All values are in UTC. Use for data-arrival analysis, not
+          business reporting.
+    facts:
+      - name: INVOICE_AMOUNT
+        expr: INVOICE_AMOUNT
+        data_type: NUMBER
+        description: >-
+          Invoice amount in the original transaction currency identified by
+          CURRENCY_CODE. Positive values are standard invoices; negative
+          values are credit memos (Baan only). Do not sum across currencies
+          without grouping by CURRENCY_CODE. Aggregation: SUM for totals, AVG
+          for average invoice size, COUNT for volume.
+    unique_keys:
+      - columns:
+          - SOURCE_SYSTEM
+          - INVOICE_NUMBER
+verified_queries:
+  - name: total_spend_by_vendor
+    question: What is the total AP spend by vendor?
+    sql: >-
+      SELECT VENDOR_NAME, CURRENCY_CODE,
+        SUM(INVOICE_AMOUNT) AS TOTAL_SPEND,
+        COUNT(*) AS INVOICE_COUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY VENDOR_NAME, CURRENCY_CODE
+      ORDER BY TOTAL_SPEND DESC
+    verified_at: 1789539479
+    verified_by: SUMA
+  - name: monthly_invoice_by_cost_center
+    question: What is the invoice count by month and business unit?
+    sql: >-
+      SELECT DATE_TRUNC('MONTH', INVOICE_DATE) AS INVOICE_MONTH,
+        COST_CENTER,
+        COUNT(*) AS INVOICE_COUNT,
+        SUM(INVOICE_AMOUNT) AS TOTAL_AMOUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY INVOICE_MONTH, COST_CENTER
+      ORDER BY INVOICE_MONTH, COST_CENTER
+    verified_at: 1789539479
+    verified_by: SUMA
+  - name: top_vendors_by_overdue
+    question: Who are the top 10 vendors by unpaid invoice amount?
+    sql: >-
+      SELECT VENDOR_NAME, CURRENCY_CODE,
+        SUM(INVOICE_AMOUNT) AS UNPAID_AMOUNT,
+        COUNT(*) AS INVOICE_COUNT
+      FROM SILVER_AP_INVOICES
+      WHERE DUE_DATE < CURRENT_DATE
+      GROUP BY VENDOR_NAME, CURRENCY_CODE
+      ORDER BY UNPAID_AMOUNT DESC
+      LIMIT 10
+    verified_at: 1789539479
+    verified_by: SUMA
+  - name: pending_approvals_by_source
+    question: How many invoices are pending approval by source system?
+    sql: >-
+      SELECT SOURCE_SYSTEM,
+        COUNT(*) AS PENDING_COUNT
+      FROM SILVER_AP_INVOICES
+      WHERE APPROVAL_STATUS = 'PENDING'
+      GROUP BY SOURCE_SYSTEM
+      ORDER BY PENDING_COUNT DESC
+    verified_at: 1789539479
+    verified_by: SUMA
+  - name: spend_by_source_and_currency
+    question: What is the spend breakdown by source system and currency?
+    sql: >-
+      SELECT SOURCE_SYSTEM, CURRENCY_CODE,
+        SUM(INVOICE_AMOUNT) AS TOTAL_SPEND,
+        COUNT(*) AS INVOICE_COUNT
+      FROM SILVER_AP_INVOICES
+      GROUP BY SOURCE_SYSTEM, CURRENCY_CODE
+      ORDER BY SOURCE_SYSTEM, CURRENCY_CODE
+    verified_at: 1789539479
+    verified_by: SUMA
